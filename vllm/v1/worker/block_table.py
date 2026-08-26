@@ -354,9 +354,11 @@ def _compute_slot_mapping_kernel(
         mask = offsets < end_idx
         pos = tl.load(positions_ptr + offsets, mask=mask, other=0)
         block_indices = pos // virtual_block_size
-        block_numbers = tl.load(block_table_ptr + row_offset + block_indices).to(
-            tl.int64
-        )
+        block_numbers = tl.load(
+            block_table_ptr + row_offset + block_indices,
+            mask=mask,
+            other=0,
+        ).to(tl.int64)
 
         virtual_block_offsets = pos - block_indices * virtual_block_size
         is_local = (
