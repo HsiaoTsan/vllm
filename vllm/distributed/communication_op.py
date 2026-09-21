@@ -9,21 +9,11 @@ import torch.distributed
 
 from .parallel_state import get_tp_group
 
-_fixed_order_notice_printed = False
-
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     group = get_tp_group()
     if os.environ.get("VLLM_TP_FIXED_ORDER_ALLREDUCE") == "1" and group.world_size > 1:
-        global _fixed_order_notice_printed
-        if not _fixed_order_notice_printed:
-            print(
-                "[BI_TP_ALLREDUCE] all_gather + fixed rank-order local sum enabled",
-                flush=True,
-            )
-            _fixed_order_notice_printed = True
-
         torch.ops.vllm.fixed_order_all_reduce_(input_, group_name=group.unique_name)
         return input_
 
