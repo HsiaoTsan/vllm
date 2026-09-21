@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
@@ -11,7 +12,12 @@ from .parallel_state import get_tp_group
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_)
+    group = get_tp_group()
+    if os.environ.get("VLLM_TP_FIXED_ORDER_ALLREDUCE") == "1" and group.world_size > 1:
+        torch.ops.vllm.fixed_order_all_reduce_(input_, group_name=group.unique_name)
+        return input_
+
+    return group.all_reduce(input_)
 
 
 def tensor_model_parallel_all_gather(

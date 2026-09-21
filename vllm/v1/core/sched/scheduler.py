@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -113,6 +114,19 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
         )
+        self.batch_invariant_prefill_chunk_size = 0
+        if envs.VLLM_BATCH_INVARIANT and (
+            self.parallel_config.prefill_context_parallel_size > 1
+            or self.parallel_config.decode_context_parallel_size > 1
+        ):
+            self.batch_invariant_prefill_chunk_size = (
+                self.scheduler_config.long_prefill_token_threshold or block_size
+            )
+            logger.info(
+                "Batch-invariant context-parallel scheduling uses canonical "
+                "%d-token prefill chunks.",
+                self.batch_invariant_prefill_chunk_size,
+            )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -352,6 +366,25 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+    def _apply_token_budget(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        token_budget: int,
+    ) -> int:
+        chunk_size = self.batch_invariant_prefill_chunk_size
+        if (
+            chunk_size > 0
+            and not request.has_encoder_inputs
+            and num_computed_tokens < request.num_prompt_tokens
+        ):
+            num_new_tokens = min(num_new_tokens, chunk_size)
+            # Defer instead of changing this request's chunk boundary according
+            # to how much of the shared batch budget other requests consumed.
+            return num_new_tokens if num_new_tokens <= token_budget else 0
+        return min(num_new_tokens, token_budget)
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -506,7 +539,12 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = self._apply_token_budget(
+                request,
+                request.num_computed_tokens,
+                num_new_tokens,
+                token_budget,
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -872,8 +910,14 @@ class Scheduler(SchedulerInterface):
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
-                    assert num_new_tokens > 0
+                    num_new_tokens = self._apply_token_budget(
+                        request,
+                        num_computed_tokens,
+                        num_new_tokens,
+                        token_budget,
+                    )
+                    if num_new_tokens == 0:
+                        break
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:

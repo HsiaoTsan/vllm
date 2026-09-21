@@ -658,6 +658,106 @@ def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     assert output2.num_scheduled_tokens[requests[2].request_id] == 800 - 224 - 224
 
 
+@pytest.mark.parametrize(
+    "model, context_parallel_kwargs",
+    [
+        ("facebook/opt-125m", {"prefill_context_parallel_size": 2}),
+        (
+            "Qwen/Qwen3-30B-A3B",
+            {"tensor_parallel_size": 8, "decode_context_parallel_size": 2},
+        ),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_batch_invariant_context_parallel_uses_canonical_prefill_chunks(
+    monkeypatch, model, context_parallel_kwargs
+):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    common_kwargs = {
+        "model": model,
+        "max_num_batched_tokens": 512,
+        "max_num_seqs": 8,
+        "max_model_len": 4096,
+        "block_size": 128,
+        **context_parallel_kwargs,
+    }
+
+    target_alone = create_requests(
+        num_requests=1,
+        num_tokens=2028,
+        req_ids=["target"],
+        block_size=128,
+    )[0]
+    scheduler = create_scheduler(**common_kwargs)
+    scheduler.add_request(target_alone)
+    alone_output = scheduler.schedule()
+
+    short_requests = create_requests(
+        num_requests=7,
+        num_tokens=12,
+        req_ids=[f"short-{i}" for i in range(7)],
+        block_size=128,
+    )
+    target_mixed = create_requests(
+        num_requests=1,
+        num_tokens=2028,
+        req_ids=["target"],
+        block_size=128,
+    )[0]
+    mixed_requests = short_requests[:5] + [target_mixed] + short_requests[5:]
+    scheduler = create_scheduler(**common_kwargs)
+    for request in mixed_requests:
+        scheduler.add_request(request)
+    mixed_output = scheduler.schedule()
+
+    assert alone_output.num_scheduled_tokens["target"] == 128
+    assert mixed_output.num_scheduled_tokens["target"] == 128
+
+
+@pytest.mark.parametrize(
+    "model, context_parallel_kwargs",
+    [
+        ("facebook/opt-125m", {"prefill_context_parallel_size": 2}),
+        (
+            "Qwen/Qwen3-30B-A3B",
+            {"tensor_parallel_size": 8, "decode_context_parallel_size": 2},
+        ),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_batch_invariant_context_parallel_defers_incomplete_canonical_chunk(
+    monkeypatch, model, context_parallel_kwargs
+):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    scheduler = create_scheduler(
+        model=model,
+        max_num_batched_tokens=128,
+        max_num_seqs=2,
+        max_model_len=4096,
+        block_size=128,
+        **context_parallel_kwargs,
+    )
+    short_request = create_requests(
+        num_requests=1,
+        num_tokens=16,
+        req_ids=["short"],
+        block_size=128,
+    )[0]
+    long_request = create_requests(
+        num_requests=1,
+        num_tokens=2028,
+        req_ids=["long"],
+        block_size=128,
+    )[0]
+    scheduler.add_request(short_request)
+    scheduler.add_request(long_request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens["short"] == 16
+    assert "long" not in output.num_scheduled_tokens
+
+
 def test_stop_via_update_from_output():
     """Test stopping behavior through update_from_output"""
     scheduler = create_scheduler(num_speculative_tokens=1)
